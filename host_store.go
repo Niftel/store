@@ -40,6 +40,46 @@ func (s *HostStore) ListByInventory(ctx context.Context, inventoryID int64) ([]m
 	return hosts, wrap("HostStore.ListByInventory", err)
 }
 
+// ListEnabledByInventory returns an inventory's enabled hosts, name-ordered. This
+// is the dispatch-path read behind the rendered Ansible inventory (see
+// inventoryrender), which excludes disabled hosts.
+func (s *HostStore) ListEnabledByInventory(ctx context.Context, inventoryID int64) ([]models.Host, error) {
+	hosts := []models.Host{}
+	err := s.db.SelectContext(ctx, &hosts, `SELECT `+HostCols+` FROM hosts WHERE inventory_id = $1 AND enabled = true ORDER BY name`, inventoryID)
+	return hosts, wrap("HostStore.ListEnabledByInventory", err)
+}
+
+// FactsByInventory returns the cached ansible_facts for every host in an inventory
+// that has them, keyed by host name — the fact cache the host-runner preloads.
+// Nil when the inventory has no stored facts.
+func (s *HostStore) FactsByInventory(ctx context.Context, inventoryID int64) (map[string]json.RawMessage, error) {
+	rows, err := s.db.QueryxContext(ctx, `
+		SELECT h.name, hf.facts
+		FROM host_facts hf JOIN hosts h ON h.id = hf.host_id
+		WHERE h.inventory_id = $1`, inventoryID)
+	if err != nil {
+		return nil, wrap("HostStore.FactsByInventory", err)
+	}
+	defer rows.Close()
+
+	out := map[string]json.RawMessage{}
+	for rows.Next() {
+		var name string
+		var facts []byte
+		if err := rows.Scan(&name, &facts); err != nil {
+			return nil, wrap("HostStore.FactsByInventory", err)
+		}
+		out[name] = json.RawMessage(facts)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrap("HostStore.FactsByInventory", err)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
 // Get returns a single host by id.
 func (s *HostStore) Get(ctx context.Context, id int64) (models.Host, error) {
 	var host models.Host

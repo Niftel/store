@@ -30,6 +30,33 @@ func (s *GroupStore) ListByInventory(ctx context.Context, inventoryID int64) ([]
 	return groups, wrap("GroupStore.ListByInventory", err)
 }
 
+// MembershipsByGroups returns host_groups memberships for the given group ids in
+// one batched query, keyed by group id. Empty input yields an empty map. Used on
+// the dispatch path by inventoryrender to attach hosts to groups without a query
+// per group.
+func (s *GroupStore) MembershipsByGroups(ctx context.Context, groupIDs []int64) (map[int64][]int64, error) {
+	out := make(map[int64][]int64, len(groupIDs))
+	if len(groupIDs) == 0 {
+		return out, nil
+	}
+	q, args, err := sqlx.In(`SELECT group_id, host_id FROM host_groups WHERE group_id IN (?)`, groupIDs)
+	if err != nil {
+		return nil, wrap("GroupStore.MembershipsByGroups", err)
+	}
+	q = s.db.Rebind(q)
+	rows := []struct {
+		GroupID int64 `db:"group_id"`
+		HostID  int64 `db:"host_id"`
+	}{}
+	if err := s.db.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, wrap("GroupStore.MembershipsByGroups", err)
+	}
+	for _, r := range rows {
+		out[r.GroupID] = append(out[r.GroupID], r.HostID)
+	}
+	return out, nil
+}
+
 // Get returns a single group by id.
 func (s *GroupStore) Get(ctx context.Context, id int64) (models.Group, error) {
 	var group models.Group
