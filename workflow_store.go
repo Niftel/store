@@ -10,12 +10,14 @@ import (
 
 // WorkflowNode is a node in a workflow template graph (also the create/update input).
 type WorkflowNode struct {
-	NodeKey       string `json:"node_key" db:"node_key"`
-	NodeType      string `json:"node_type" db:"node_type"` // job | approval | webhook_in | webhook_out
-	JobTemplateID *int64 `json:"job_template_id" db:"job_template_id"`
-	Name          string `json:"name" db:"name"`
-	WebhookURL    string `json:"webhook_url" db:"webhook_url"`
-	WebhookBody   string `json:"webhook_body" db:"webhook_body"`
+	NodeKey                string `json:"node_key" db:"node_key"`
+	NodeType               string `json:"node_type" db:"node_type"` // job | approval | webhook_in | webhook_out
+	JobTemplateID          *int64 `json:"job_template_id" db:"job_template_id"`
+	Name                   string `json:"name" db:"name"`
+	WebhookURL             string `json:"webhook_url" db:"webhook_url"`
+	WebhookBody            string `json:"webhook_body" db:"webhook_body"`
+	ApprovalTimeoutSeconds int    `json:"approval_timeout_seconds" db:"approval_timeout_seconds"`
+	ApprovalTimeoutAction  string `json:"approval_timeout_action" db:"approval_timeout_action"`
 }
 
 // WorkflowEdge is an edge in a workflow template/job graph.
@@ -75,15 +77,20 @@ type WorkflowJobMeta struct {
 // WorkflowJobNode is a node's live state within a run. CallbackURL is populated by
 // the handler (not scanned) while a webhook_in node is awaiting an event.
 type WorkflowJobNode struct {
-	ID           int64   `json:"id" db:"id"`
-	NodeKey      string  `json:"node_key" db:"node_key"`
-	NodeType     string  `json:"node_type" db:"node_type"`
-	Name         string  `json:"name" db:"name"`
-	UnifiedJobID *int64  `json:"unified_job_id" db:"unified_job_id"`
-	RunID        *string `json:"run_id" db:"run_id"`
-	Status       string  `json:"status" db:"status"`
-	EventToken   string  `json:"-" db:"event_token"`
-	CallbackURL  string  `json:"callback_url,omitempty" db:"-"`
+	ID                     int64      `json:"id" db:"id"`
+	NodeKey                string     `json:"node_key" db:"node_key"`
+	NodeType               string     `json:"node_type" db:"node_type"`
+	Name                   string     `json:"name" db:"name"`
+	UnifiedJobID           *int64     `json:"unified_job_id" db:"unified_job_id"`
+	RunID                  *string    `json:"run_id" db:"run_id"`
+	Status                 string     `json:"status" db:"status"`
+	EventToken             string     `json:"-" db:"event_token"`
+	CallbackURL            string     `json:"callback_url,omitempty" db:"-"`
+	ApprovalTimeoutSeconds int        `json:"approval_timeout_seconds,omitempty" db:"approval_timeout_seconds"`
+	ApprovalTimeoutAction  string     `json:"approval_timeout_action,omitempty" db:"approval_timeout_action"`
+	AwaitingSince          *time.Time `json:"awaiting_since,omitempty" db:"awaiting_since"`
+	DecidedAt              *time.Time `json:"decided_at,omitempty" db:"decided_at"`
+	TimedOut               bool       `json:"timed_out,omitempty" db:"timed_out"`
 }
 
 // WorkflowStore is the data-access layer for the workflows domain.
@@ -129,10 +136,13 @@ func insertGraph(ctx context.Context, tx *sqlx.Tx, templateID int64, spec Workfl
 		if n.NodeType == "" {
 			n.NodeType = "job"
 		}
+		if n.ApprovalTimeoutAction == "" {
+			n.ApprovalTimeoutAction = "rejected"
+		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO workflow_nodes (workflow_template_id, node_key, node_type, job_template_id, name, webhook_url, webhook_body)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			templateID, n.NodeKey, n.NodeType, n.JobTemplateID, n.Name, wfNullIfEmpty(n.WebhookURL), wfNullIfEmpty(n.WebhookBody)); err != nil {
+			`INSERT INTO workflow_nodes (workflow_template_id, node_key, node_type, job_template_id, name, webhook_url, webhook_body, approval_timeout_seconds, approval_timeout_action)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			templateID, n.NodeKey, n.NodeType, n.JobTemplateID, n.Name, wfNullIfEmpty(n.WebhookURL), wfNullIfEmpty(n.WebhookBody), n.ApprovalTimeoutSeconds, n.ApprovalTimeoutAction); err != nil {
 			return wrap("insertGraph", err)
 		}
 	}
@@ -202,7 +212,8 @@ func (s *WorkflowStore) TemplateNodes(ctx context.Context, templateID int64) ([]
 	nodes := []WorkflowNode{}
 	err := s.db.SelectContext(ctx, &nodes,
 		`SELECT node_key, node_type, job_template_id, name,
-		        COALESCE(webhook_url,'') AS webhook_url, COALESCE(webhook_body,'') AS webhook_body
+		        COALESCE(webhook_url,'') AS webhook_url, COALESCE(webhook_body,'') AS webhook_body,
+		        approval_timeout_seconds, approval_timeout_action
 		 FROM workflow_nodes WHERE workflow_template_id=$1`, templateID)
 	return nodes, wrap("WorkflowStore.TemplateNodes", err)
 }
@@ -299,6 +310,8 @@ func (s *WorkflowStore) JobNodes(ctx context.Context, jobID int64) ([]WorkflowJo
 		SELECT wjn.id, wjn.node_key, wjn.node_type,
 		       COALESCE(wjn.name, '') AS name, wjn.unified_job_id, wjn.status,
 		       COALESCE(wjn.event_token, '') AS event_token,
+		       wjn.approval_timeout_seconds, wjn.approval_timeout_action,
+		       wjn.awaiting_since, wjn.decided_at, wjn.timed_out,
 		       er.id AS run_id
 		FROM workflow_job_nodes wjn
 		LEFT JOIN LATERAL (
