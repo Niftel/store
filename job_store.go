@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -77,6 +79,177 @@ func (s *JobStore) ListEvents(ctx context.Context, runID uuid.UUID) ([]models.Jo
 	return events, wrap("JobStore.ListEvents", err)
 }
 
+type DiagnosticQuery struct {
+	AfterSeq int64
+	Limit    int
+	Kind     string
+	Outcome  string
+}
+
+type DiagnosticEvent struct {
+	Seq         int64     `db:"seq"`
+	EventType   string    `db:"event_type"`
+	HostID      *int64    `db:"host_id"`
+	TaskName    *string   `db:"task_name"`
+	PlayName    *string   `db:"play_name"`
+	Outcome     *string   `db:"outcome"`
+	Changed     bool      `db:"changed"`
+	DurationMS  *int64    `db:"duration_ms"`
+	FailureCode *string   `db:"failure_code"`
+	CreatedAt   time.Time `db:"created_at"`
+}
+
+type DiagnosticSummary struct {
+	UnifiedJobID     int64      `db:"unified_job_id"`
+	RunState         string     `db:"run_state"`
+	LastEventSeq     int64      `db:"last_event_seq"`
+	StartedAt        *time.Time `db:"started_at"`
+	FinishedAt       *time.Time `db:"finished_at"`
+	SourceJobID      *int64     `db:"source_job_id"`
+	Attempt          int        `db:"attempt"`
+	SubsequentJobIDs []int64
+	CurrentPhase     string
+	SafeFailureCode  string
+}
+
+// ListDiagnostics returns an exclusive, sequence-keyed page. Kind and outcome
+// are validated by the handler; the SQL remains bounded and uses the composite
+// run/filter/sequence indexes declared with the diagnostics migration.
+func (s *JobStore) ListDiagnostics(ctx context.Context, runID uuid.UUID, query DiagnosticQuery) ([]DiagnosticEvent, error) {
+	if query.Limit < 1 || query.Limit > 200 {
+		return nil, fmt.Errorf("diagnostic limit must be between 1 and 200")
+	}
+	where := []string{"execution_run_id = $1", "seq > $2"}
+	args := []interface{}{runID, query.AfterSeq}
+	if query.Outcome != "" {
+		args = append(args, query.Outcome)
+		where = append(where, fmt.Sprintf("diagnostic_outcome = $%d", len(args)))
+	}
+	if query.Kind != "" && query.Kind != "all" {
+		var eventTypes []string
+		switch query.Kind {
+		case "lifecycle":
+			eventTypes = []string{"JOB_STARTED", "JOB_COMPLETED", "JOB_FAILED", "JOB_CANCELED", "RUNNER_ONLINE", "RESUMED_FROM_CHECKPOINT"}
+		case "task":
+			eventTypes = []string{"PLAY_STARTED", "TASK_STARTED", "TASK_COMPLETED"}
+		case "host":
+			eventTypes = []string{"HOST_OK", "HOST_CHANGED", "HOST_FAILED", "HOST_UNREACHABLE", "HOST_SKIPPED"}
+		case "failure":
+			eventTypes = []string{"JOB_FAILED", "HOST_FAILED", "HOST_UNREACHABLE"}
+		default:
+			return nil, fmt.Errorf("unsupported diagnostic kind")
+		}
+		placeholders := make([]string, 0, len(eventTypes))
+		for _, eventType := range eventTypes {
+			args = append(args, eventType)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		where = append(where, "event_type IN ("+strings.Join(placeholders, ",")+")")
+	}
+	args = append(args, query.Limit+1)
+	statement := `SELECT seq, event_type, host_id, task_name, play_name,
+		CASE WHEN event_data->>'outcome' IN ('ok','changed','failed','unreachable','skipped')
+			THEN event_data->>'outcome' END AS outcome,
+		CASE WHEN event_data->>'changed' IN ('true','false')
+			THEN (event_data->>'changed')::boolean ELSE false END AS changed,
+		CASE WHEN event_data->>'duration_ms' ~ '^[0-9]+$'
+			THEN (event_data->>'duration_ms')::bigint END AS duration_ms,
+		CASE WHEN event_data->>'failure_code' IN ('task_failed','host_unreachable','execution_failed','ignored')
+			THEN event_data->>'failure_code' END AS failure_code,
+		created_at
+		FROM job_events WHERE ` + strings.Join(where, " AND ") +
+		` ORDER BY seq ASC LIMIT $` + fmt.Sprint(len(args))
+	events := []DiagnosticEvent{}
+	if err := s.db.SelectContext(ctx, &events, statement, args...); err != nil {
+		return nil, wrap("JobStore.ListDiagnostics", err)
+	}
+	return events, nil
+}
+
+func (s *JobStore) DiagnosticSummary(ctx context.Context, runID uuid.UUID) (DiagnosticSummary, error) {
+	var summary DiagnosticSummary
+	err := s.db.GetContext(ctx, &summary, `
+		WITH RECURSIVE lineage AS (
+			SELECT uj.id, uj.source_job_id, 1 AS depth
+			FROM execution_runs er JOIN unified_jobs uj ON uj.id = er.unified_job_id
+			WHERE er.id = $1
+			UNION ALL
+			SELECT parent.id, parent.source_job_id, lineage.depth + 1
+			FROM unified_jobs parent JOIN lineage ON parent.id = lineage.source_job_id
+		)
+		SELECT er.unified_job_id, er.state AS run_state, er.last_event_seq,
+			er.started_at, er.finished_at, uj.source_job_id, MAX(lineage.depth)::int AS attempt
+		FROM execution_runs er
+		JOIN unified_jobs uj ON uj.id = er.unified_job_id
+		JOIN lineage ON true
+		WHERE er.id = $1
+		GROUP BY er.unified_job_id, er.state, er.last_event_seq, er.started_at,
+			er.finished_at, uj.source_job_id`, runID)
+	if err != nil {
+		return summary, wrap("JobStore.DiagnosticSummary", err)
+	}
+	_ = s.db.SelectContext(ctx, &summary.SubsequentJobIDs, `
+		WITH RECURSIVE descendants AS (
+			SELECT id FROM unified_jobs WHERE source_job_id = $1
+			UNION ALL
+			SELECT child.id FROM unified_jobs child
+			JOIN descendants parent ON child.source_job_id = parent.id
+		)
+		SELECT id FROM descendants ORDER BY id`, summary.UnifiedJobID)
+
+	var eventType string
+	var failureCode *string
+	_ = s.db.QueryRowContext(ctx, `
+		SELECT event_type,
+			CASE WHEN event_data->>'failure_code' IN ('task_failed','host_unreachable','execution_failed','ignored')
+				THEN event_data->>'failure_code' END
+		FROM job_events WHERE execution_run_id=$1 ORDER BY seq DESC LIMIT 1`, runID).Scan(&eventType, &failureCode)
+	summary.CurrentPhase, summary.SafeFailureCode = classifyDiagnostic(summary.RunState, eventType, failureCode)
+	return summary, nil
+}
+
+func classifyDiagnostic(state, eventType string, failureCode *string) (string, string) {
+	phase := "queued"
+	switch {
+	case state == "successful" || state == "failed" || state == "canceled" || state == "error" || state == "lost":
+		phase = "complete"
+	case eventType == "RUNNER_ONLINE" || eventType == "RESUMED_FROM_CHECKPOINT" || strings.HasPrefix(eventType, "PLAY_") || strings.HasPrefix(eventType, "TASK_") || strings.HasPrefix(eventType, "HOST_"):
+		phase = "executing"
+	case state == "running" || state == "starting":
+		phase = "starting"
+	}
+	if failureCode != nil {
+		return phase, *failureCode
+	}
+	switch eventType {
+	case "HOST_UNREACHABLE":
+		return phase, "host_unreachable"
+	case "HOST_FAILED":
+		return phase, "task_failed"
+	case "JOB_FAILED":
+		return phase, "execution_failed"
+	}
+	return phase, ""
+}
+
+// SetRelaunchSource links a newly-created job to an authorized source only when
+// both jobs are governed by the same unified template.
+func (s *JobStore) SetRelaunchSource(ctx context.Context, jobID, sourceJobID, unifiedTemplateID int64) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE unified_jobs target SET source_job_id = source.id
+		FROM unified_jobs source
+		WHERE target.id=$1 AND source.id=$2
+		AND target.unified_job_template_id=$3
+		AND source.unified_job_template_id=$3`, jobID, sourceJobID, unifiedTemplateID)
+	if err != nil {
+		return wrap("JobStore.SetRelaunchSource", err)
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return fmt.Errorf("source job does not belong to the governing template")
+	}
+	return nil
+}
+
 // TemplateIDForRun resolves the job_templates.id governing a run, via
 // unified_job -> unified_job_template_id. ok is false when the run has no
 // governing template (e.g. an ad-hoc / inventory-sync job) — that is the ONLY
@@ -98,6 +271,25 @@ func (s *JobStore) TemplateIDForRun(ctx context.Context, runID uuid.UUID) (int64
 		return 0, false, wrap("JobStore.TemplateIDForRun", err)
 	}
 	return jtID, true, nil
+}
+
+// InventoryIDForRun resolves the inventory whose host identities appear in a
+// run's diagnostics. A nil id is valid for localhost/template-less execution.
+func (s *JobStore) InventoryIDForRun(ctx context.Context, runID uuid.UUID) (*int64, error) {
+	var inventoryID *int64
+	err := s.db.GetContext(ctx, &inventoryID, `
+		SELECT jt.inventory_id
+		FROM execution_runs er
+		JOIN unified_jobs uj ON er.unified_job_id = uj.id
+		JOIN job_templates jt ON uj.unified_job_template_id = jt.unified_job_template_id
+		WHERE er.id = $1`, runID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, wrap("JobStore.InventoryIDForRun", err)
+	}
+	return inventoryID, nil
 }
 
 // --- write paths (jobs domain) ---
