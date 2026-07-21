@@ -375,13 +375,16 @@ func (s *JobStore) InsertJobEvent(ctx context.Context, evt *models.JobEvent) (in
 type JobCancelInfo struct {
 	Status               string `db:"status"`
 	UnifiedJobTemplateID *int64 `db:"unified_job_template_id"`
+	InventorySourceID    *int64 `db:"inventory_source_id"`
 }
 
 // JobCancelInfo loads a job's status + governing unified template id.
 func (s *JobStore) JobCancelInfo(ctx context.Context, jobID int64) (JobCancelInfo, error) {
 	var info JobCancelInfo
 	err := s.db.GetContext(ctx, &info,
-		`SELECT status, unified_job_template_id FROM unified_jobs WHERE id = $1`, jobID)
+		`SELECT status, unified_job_template_id,
+		        CASE WHEN job_args ? 'inventory_source_id' THEN (job_args->>'inventory_source_id')::BIGINT END AS inventory_source_id
+		 FROM unified_jobs WHERE id = $1`, jobID)
 	if err != nil {
 		return info, fmt.Errorf("load job cancel info: %w", err)
 	}
