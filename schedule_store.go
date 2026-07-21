@@ -34,7 +34,9 @@ func (s *ScheduleStore) ListByTargetOrgIDs(ctx context.Context, orgIDs []int64) 
 		SELECT `+Prefixed("s", ScheduleCols)+` FROM schedules s
 		LEFT JOIN workflow_templates wt ON wt.id = s.workflow_template_id
 		LEFT JOIN job_templates jt ON jt.unified_job_template_id = s.unified_job_template_id
-		WHERE COALESCE(wt.organization_id, jt.organization_id) IN (?)
+		LEFT JOIN inventory_sources src ON src.id = s.inventory_source_id
+		LEFT JOIN inventories inv ON inv.id = src.inventory_id
+		WHERE COALESCE(wt.organization_id, jt.organization_id, inv.organization_id) IN (?)
 		ORDER BY s.id ASC`, orgIDs)
 	if err != nil {
 		return nil, wrap("ScheduleStore.ListByTargetOrgIDs", err)
@@ -55,8 +57,8 @@ func (s *ScheduleStore) Get(ctx context.Context, id int64) (models.Schedule, err
 // the new id.
 func (s *ScheduleStore) Create(ctx context.Context, sched models.Schedule) (int64, error) {
 	query := `
-		INSERT INTO schedules (name, description, unified_job_template_id, workflow_template_id, rrule, next_run, enabled, extra_vars, created_at, modified_at)
-		VALUES (:name, :description, :unified_job_template_id, :workflow_template_id, :rrule, :next_run, :enabled, :extra_vars, :created_at, :modified_at)
+		INSERT INTO schedules (name, description, unified_job_template_id, workflow_template_id, inventory_source_id, actor_user_id, rrule, next_run, enabled, extra_vars, created_at, modified_at)
+		VALUES (:name, :description, :unified_job_template_id, :workflow_template_id, :inventory_source_id, :actor_user_id, :rrule, :next_run, :enabled, :extra_vars, :created_at, :modified_at)
 		RETURNING id`
 	rows, err := s.db.NamedQuery(query, sched)
 	if err != nil {
@@ -79,7 +81,9 @@ func (s *ScheduleStore) Update(ctx context.Context, sched models.Schedule) error
 		SET name=:name, description=:description, rrule=:rrule, next_run=:next_run,
 		    enabled=:enabled, extra_vars=:extra_vars, modified_at=:modified_at,
 		    unified_job_template_id=:unified_job_template_id,
-		    workflow_template_id=:workflow_template_id
+		    workflow_template_id=:workflow_template_id,
+		    inventory_source_id=:inventory_source_id,
+		    actor_user_id=:actor_user_id
 		WHERE id = :id`
 	_, err := s.db.NamedExecContext(ctx, query, sched)
 	return wrap("ScheduleStore.Update", err)
@@ -93,7 +97,7 @@ func (s *ScheduleStore) Delete(ctx context.Context, id int64) error {
 
 // TargetOrg resolves the organization of a schedule's target (workflow XOR job
 // template). ok is false when neither target resolves.
-func (s *ScheduleStore) TargetOrg(ctx context.Context, wfID, ujtID *int64) (int64, bool) {
+func (s *ScheduleStore) TargetOrg(ctx context.Context, wfID, ujtID, sourceID *int64) (int64, bool) {
 	var org int64
 	switch {
 	case wfID != nil:
@@ -101,6 +105,9 @@ func (s *ScheduleStore) TargetOrg(ctx context.Context, wfID, ujtID *int64) (int6
 		return org, err == nil
 	case ujtID != nil:
 		err := s.db.GetContext(ctx, &org, `SELECT organization_id FROM job_templates WHERE unified_job_template_id=$1`, *ujtID)
+		return org, err == nil
+	case sourceID != nil:
+		err := s.db.GetContext(ctx, &org, `SELECT i.organization_id FROM inventory_sources src JOIN inventories i ON i.id=src.inventory_id WHERE src.id=$1`, *sourceID)
 		return org, err == nil
 	}
 	return 0, false
@@ -110,13 +117,22 @@ func (s *ScheduleStore) TargetOrg(ctx context.Context, wfID, ujtID *int64) (int6
 func (s *ScheduleStore) ScheduleOrg(ctx context.Context, id int64) (int64, bool) {
 	var org sql.NullInt64
 	err := s.db.GetContext(ctx, &org, `
-		SELECT COALESCE(wt.organization_id, jt.organization_id)
+		SELECT COALESCE(wt.organization_id, jt.organization_id, inv.organization_id)
 		FROM schedules s
 		LEFT JOIN workflow_templates wt ON wt.id = s.workflow_template_id
 		LEFT JOIN job_templates jt ON jt.unified_job_template_id = s.unified_job_template_id
+		LEFT JOIN inventory_sources src ON src.id = s.inventory_source_id
+		LEFT JOIN inventories inv ON inv.id = src.inventory_id
 		WHERE s.id=$1`, id)
 	if err != nil || !org.Valid {
 		return 0, false
 	}
 	return org.Int64, true
+}
+
+// InventoryIDBySource resolves the parent inventory used for source-scoped RBAC.
+func (s *ScheduleStore) InventoryIDBySource(ctx context.Context, sourceID int64) (int64, bool) {
+	var inventoryID int64
+	err := s.db.GetContext(ctx, &inventoryID, `SELECT inventory_id FROM inventory_sources WHERE id=$1`, sourceID)
+	return inventoryID, err == nil
 }
