@@ -14,3 +14,5 @@ github.com/praetordev/launch v0.1.0 h1:VIuFNHiYQHJGX8JW1VrN0+Z6Q0XllKLYMOHd/6lzK
 github.com/praetordev/launch v0.1.0/go.mod h1:rCG3gRZUpzZkIC+avzl2skhOJAgPTovXtYLcxr7eCBA=
 github.com/praetordev/models v0.1.0 h1:1ikKBvWFROkgP6SmKGSb6msuNTvFzHIcp0Ka8YJArnM=
 github.com/praetordev/models v0.1.0/go.mod h1:Q0VzThsStaMr64YW3kAe8pCFT846k75RU0dJj2nETMc=
+github.com/praetordev/models v0.2.1 h1:+Zn+2ayyOOohXDjfL9m8e9ogoKs+hIb/tVjcgO1zKqM=
+github.com/praetordev/models v0.2.1/go.mod h1:Q0VzThsStaMr64YW3kAe8pCFT846k75RU0dJj2nETMc=
