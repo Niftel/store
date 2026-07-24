@@ -63,6 +63,60 @@ func (s *JobStore) ListReadable(ctx context.Context, tmplIDs []int64, limit int)
 	return jobs, wrap("JobStore.ListReadable", err)
 }
 
+// ListReadableByScopes returns recent jobs governed by either an authorized job
+// template or an authorized inventory. Inventory ownership is resolved through
+// inventory_sync_history, whose inventory_id is populated by the database from
+// the inventory source at enqueue time. Callers must supply only IDs already
+// authorized for the requesting principal; empty scopes fail closed.
+func (s *JobStore) ListReadableByScopes(ctx context.Context, tmplIDs, inventoryIDs []int64, limit int) ([]models.UnifiedJob, error) {
+	jobs := []models.UnifiedJob{}
+	q, queryArgs, ok, err := readableByScopesQuery(tmplIDs, inventoryIDs, limit)
+	if err != nil {
+		return nil, wrap("JobStore.ListReadableByScopes", err)
+	}
+	if !ok {
+		return jobs, nil
+	}
+	q = s.db.Rebind(q)
+	err = s.db.SelectContext(ctx, &jobs, q, queryArgs...)
+	return jobs, wrap("JobStore.ListReadableByScopes", err)
+}
+
+func readableByScopesQuery(tmplIDs, inventoryIDs []int64, limit int) (string, []interface{}, bool, error) {
+	clauses := make([]string, 0, 2)
+	args := make([]interface{}, 0, 3)
+	if len(tmplIDs) > 0 {
+		clauses = append(clauses, `EXISTS (
+			SELECT 1 FROM job_templates jt
+			WHERE jt.unified_job_template_id = uj.unified_job_template_id
+			  AND jt.id IN (?)
+		)`)
+		args = append(args, tmplIDs)
+	}
+	if len(inventoryIDs) > 0 {
+		clauses = append(clauses, `EXISTS (
+			SELECT 1 FROM inventory_sync_history ish
+			WHERE ish.unified_job_id = uj.id
+			  AND ish.inventory_id IN (?)
+		)`)
+		args = append(args, inventoryIDs)
+	}
+	if len(clauses) == 0 {
+		return "", nil, false, nil
+	}
+	args = append(args, limit)
+	q, queryArgs, err := sqlx.In(`
+		SELECT `+prefixed("uj", unifiedJobCols)+`
+		FROM unified_jobs uj
+		WHERE (`+strings.Join(clauses, " OR ")+`)
+		ORDER BY uj.created_at DESC, uj.id DESC
+		LIMIT ?`, args...)
+	if err != nil {
+		return "", nil, false, err
+	}
+	return q, queryArgs, true, nil
+}
+
 // GetRun returns a single execution run by id.
 func (s *JobStore) GetRun(ctx context.Context, runID uuid.UUID) (models.ExecutionRun, error) {
 	var run models.ExecutionRun
